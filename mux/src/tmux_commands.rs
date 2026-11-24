@@ -762,6 +762,112 @@ impl TmuxCommand for ListAllPanes {
     }
 }
 
+/// The `#{...}` fields requested by `ListAllWindows`, in output order.
+/// The `-F` format string and the parser are both derived from this list.
+///
+/// Fields are separated by spaces, so only the final field may contain
+/// spaces: it absorbs the rest of the line. `window_name` is free-form text
+/// and must therefore stay last; every other field must be space-free.
+/// This is enforced by `list_windows_fields_free_text_last`.
+const LIST_WINDOWS_FIELDS: &[&str] = &[
+    "session_id",
+    "window_id",
+    "window_width",
+    "window_height",
+    "window_active",
+    "window_layout",
+    "history_limit",
+    "window_name",
+];
+
+/// Build the `-F` format argument for `list-windows` from `LIST_WINDOWS_FIELDS`.
+fn list_windows_format() -> String {
+    LIST_WINDOWS_FIELDS
+        .iter()
+        .map(|f| format!("#{{{f}}}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse one line of `list-windows` output produced with `list_windows_format()`.
+fn parse_list_windows_line(line: &str) -> anyhow::Result<WindowItem> {
+    let values: Vec<&str> = line.splitn(LIST_WINDOWS_FIELDS.len(), ' ').collect();
+    if values.len() != LIST_WINDOWS_FIELDS.len() {
+        anyhow::bail!(
+            "expected {} fields, got {}",
+            LIST_WINDOWS_FIELDS.len(),
+            values.len()
+        );
+    }
+    let field = |name: &str| -> &str {
+        let idx = LIST_WINDOWS_FIELDS
+            .iter()
+            .position(|f| *f == name)
+            .expect("field is listed in LIST_WINDOWS_FIELDS");
+        values[idx]
+    };
+
+    let session_id = parse_sigil_number(field("session_id")).context("session_id")?;
+    let window_id = parse_sigil_number(field("window_id")).context("window_id")?;
+    let window_width = field("window_width").parse().context("window_width")?;
+    let window_height = field("window_height").parse().context("window_height")?;
+    let window_active = field("window_active")
+        .parse::<usize>()
+        .context("window_active")?
+        == 1;
+    let history_limit = field("history_limit")
+        .parse::<isize>()
+        .context("history_limit")?;
+    let window_name = field("window_name");
+
+    let window_layout = field("window_layout");
+    let layout_csum = window_layout
+        .get(0..4)
+        .ok_or_else(|| anyhow!("missing window_layout"))?;
+    let window_layout = window_layout
+        .get(5..)
+        .ok_or_else(|| anyhow!("missing window_layout"))?;
+    let layout = parse_layout(window_layout).context("window_layout")?;
+
+    Ok(WindowItem {
+        session_id,
+        window_id,
+        window_width,
+        window_height,
+        window_active,
+        window_name: window_name.to_string(),
+        layout,
+        layout_csum: layout_csum.to_string(),
+        history_limit,
+    })
+}
+
+/// Parse the full `list-windows` output, optionally keeping only `window_id`.
+/// A line that fails to parse is logged and skipped rather than discarding
+/// every window: one odd window must not prevent the others from syncing.
+fn parse_list_windows_output(output: &str, window_id: Option<TmuxWindowId>) -> Vec<WindowItem> {
+    let mut items = vec![];
+    for line in output.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let item = match parse_list_windows_line(line) {
+            Ok(item) => item,
+            Err(err) => {
+                log::error!("Skipping unparseable tmux list-windows line {line:?}: {err:#}");
+                continue;
+            }
+        };
+        if let Some(x) = window_id {
+            if x != item.window_id {
+                continue;
+            }
+        }
+        items.push(item);
+    }
+    items
+}
+
 #[derive(Debug)]
 pub(crate) struct ListAllWindows {
     pub session_id: TmuxSessionId,
@@ -771,13 +877,8 @@ pub(crate) struct ListAllWindows {
 impl TmuxCommand for ListAllWindows {
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
-            "list-windows -F \
-                '#{{session_id}} #{{window_id}} \
-                #{{window_width}} #{{window_height}} \
-                #{{window_active}} \
-                #{{window_name}} \
-                #{{window_layout}} \
-                #{{history_limit}}' -t ${}\n",
+            "list-windows -F '{}' -t ${}\n",
+            list_windows_format(),
             self.session_id
         )
     }
@@ -788,72 +889,7 @@ impl TmuxCommand for ListAllWindows {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
-        let mut items = vec![];
-
-        for line in result.output.split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let mut fields = line.split(' ');
-            let session_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing session_id"))?)?;
-            let window_id =
-                parse_sigil_number(fields.next().ok_or_else(|| anyhow!("missing window_id"))?)?;
-            let window_width = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_width"))?
-                .parse()?;
-            let window_height = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_height"))?
-                .parse()?;
-            let window_active = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_active"))?
-                .parse::<usize>()?;
-
-            let window_name = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_name"))?;
-
-            let window_layout = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let history_limit = fields
-                .next()
-                .ok_or_else(|| anyhow!("missing history_limit"))?
-                .parse::<isize>()?;
-
-            let window_active = window_active == 1;
-
-            if let Some(x) = self.window_id {
-                if x != window_id {
-                    continue;
-                }
-            }
-
-            let layout_csum = window_layout
-                .get(0..4)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-            let window_layout = window_layout
-                .get(5..)
-                .ok_or_else(|| anyhow!("missing window_layout"))?;
-
-            let layout = parse_layout(window_layout)?;
-
-            items.push(WindowItem {
-                session_id,
-                window_id,
-                window_width,
-                window_height,
-                window_active,
-                window_name: window_name.to_string(),
-                layout,
-                layout_csum: layout_csum.to_string(),
-                history_limit,
-            });
-        }
+        let items = parse_list_windows_output(&result.output, self.window_id);
 
         log::debug!("layout in domain_id {}: {:#?}", domain_id, items);
         let mux = Mux::get();
@@ -1194,5 +1230,89 @@ impl TmuxCommand for AttachDone {
         // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const LAYOUT: &str = "b25d,80x24,0,0,3";
+
+    #[test]
+    fn list_windows_fields_free_text_last() {
+        assert_eq!(LIST_WINDOWS_FIELDS.last(), Some(&"window_name"));
+        let unique: HashSet<_> = LIST_WINDOWS_FIELDS.iter().collect();
+        assert_eq!(unique.len(), LIST_WINDOWS_FIELDS.len());
+    }
+
+    #[test]
+    fn list_windows_command_format() {
+        let cmd = ListAllWindows {
+            session_id: 3,
+            window_id: None,
+        };
+        assert_eq!(
+            cmd.get_command(0),
+            "list-windows -F '#{session_id} #{window_id} #{window_width} \
+             #{window_height} #{window_active} #{window_layout} \
+             #{history_limit} #{window_name}' -t $3\n"
+        );
+    }
+
+    #[test]
+    fn list_windows_line_simple_name() {
+        let item = parse_list_windows_line(&format!("$1 @2 80 24 1 {LAYOUT} 2000 bash")).unwrap();
+        assert_eq!(item.session_id, 1);
+        assert_eq!(item.window_id, 2);
+        assert_eq!(item.window_width, 80);
+        assert_eq!(item.window_height, 24);
+        assert!(item.window_active);
+        assert_eq!(item.layout_csum, "b25d");
+        assert_eq!(item.layout.len(), 1);
+        assert_eq!(item.history_limit, 2000);
+        assert_eq!(item.window_name, "bash");
+    }
+
+    #[test]
+    fn list_windows_line_name_with_spaces() {
+        let item =
+            parse_list_windows_line(&format!("$0 @5 80 24 0 {LAYOUT} 2000 nate@dev01: ~/a  b "))
+                .unwrap();
+        assert_eq!(item.window_id, 5);
+        assert!(!item.window_active);
+        assert_eq!(item.history_limit, 2000);
+        assert_eq!(item.window_name, "nate@dev01: ~/a  b ");
+    }
+
+    #[test]
+    fn list_windows_line_empty_name() {
+        let item = parse_list_windows_line(&format!("$0 @5 80 24 0 {LAYOUT} 2000 ")).unwrap();
+        assert_eq!(item.window_name, "");
+    }
+
+    #[test]
+    fn list_windows_line_too_few_fields() {
+        assert!(parse_list_windows_line(&format!("$0 @5 80 24 0 {LAYOUT}")).is_err());
+        assert!(parse_list_windows_line("b").is_err());
+    }
+
+    #[test]
+    fn list_windows_output_skips_bad_lines() {
+        // A pre-3.7 `new-window -n $'a\nb'` name splits one record over two
+        // lines; the fragment must not prevent the other windows from syncing.
+        let output = format!(
+            "$0 @1 80 24 1 {LAYOUT} 2000 one\n\
+             $0 @2 80 24 0 {LAYOUT} 2000 a\n\
+             b\n\
+             $0 @3 80 24 0 {LAYOUT} 2000 three four\n"
+        );
+        let items = parse_list_windows_output(&output, None);
+        let names: Vec<_> = items.iter().map(|i| i.window_name.as_str()).collect();
+        assert_eq!(names, ["one", "a", "three four"]);
+
+        let items = parse_list_windows_output(&output, Some(3));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].window_name, "three four");
     }
 }
